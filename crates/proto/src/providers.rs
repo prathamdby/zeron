@@ -6,9 +6,9 @@ use crate::HarnessId;
 
 /// The providers zeron can sign into, in display order: (harness, name, CLI
 /// command — named in the empty-state copy, zeron settings.agents.tsx
-/// `PROVIDERS`). Every agent with a login of its own is here; what each one
-/// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
+/// `PROVIDERS`). Only sign-ins supported by the engine are listed; what each
+/// one supports is documented engine-side (`agent_accounts` module docs).
+pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -17,7 +17,6 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
     (HarnessId::Devin, "Devin", "devin auth login"),
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
     (HarnessId::Pi, "Pi", "pi"),
-    (HarnessId::Droid, "Factory Droid", "droid"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
     (HarnessId::Muse, "Muse Code", "muse login"),
 ];
@@ -32,6 +31,9 @@ pub fn signs_in(harness: HarnessId) -> bool {
 pub fn provider_name(harness: HarnessId) -> &'static str {
     if harness == HarnessId::Fx {
         return "fx";
+    }
+    if harness == HarnessId::Droid {
+        return "Factory Droid";
     }
     PROVIDERS
         .iter()
