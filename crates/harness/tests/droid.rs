@@ -539,6 +539,7 @@ mod fixture {
             ("other", Some(ReasoningLevel::High), DoneStatus::Completed),
             ("new-default", None, DoneStatus::Completed),
             ("coerce", Some(ReasoningLevel::High), DoneStatus::Errored),
+            ("uncorrelated-settings", None, DoneStatus::Errored),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (controls, sender, _) = controls(None);
@@ -557,7 +558,11 @@ mod fixture {
             sender.send(steer).await.unwrap();
             drop(sender);
             let events = tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(if model == "uncorrelated-settings" {
+                    25
+                } else {
+                    5
+                }),
                 stream.map(Result::unwrap).collect::<Vec<_>>(),
             )
             .await
@@ -581,6 +586,9 @@ mod fixture {
                 "{events:?}"
             );
             assert_eq!(status(&events), expected);
+            if model == "uncorrelated-settings" {
+                assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { error: Some(error), .. } if error.contains("Droid settings update timed out"))), "{events:?}");
+            }
             assert_eq!(
                 text(&events).contains("reply:configured:done"),
                 expected == DoneStatus::Completed

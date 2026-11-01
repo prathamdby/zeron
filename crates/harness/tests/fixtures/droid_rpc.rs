@@ -240,7 +240,14 @@ fn main() {
                 if settings["modelId"] == "cap" {
                     settings["availableAutonomyLevels"] = json!(["off"]);
                 }
-                notify(json!({"type":"settings_updated","requestId":id,"settings":settings}));
+                let request_id = if settings["modelId"] == "uncorrelated-settings" {
+                    json!(format!("unrelated-{}", id.as_str().unwrap()))
+                } else {
+                    id.clone()
+                };
+                notify(
+                    json!({"type":"settings_updated","requestId":request_id,"settings":settings}),
+                );
                 reply(id, json!({}));
             }
             "droid.interrupt_session" => {
