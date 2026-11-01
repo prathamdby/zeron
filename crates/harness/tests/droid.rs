@@ -238,6 +238,67 @@ mod fixture {
         )));
         assert!(!turn.background_live());
     }
+    async fn child_events(prompt: &str) -> Vec<AgentEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path(), prompt);
+        req.env.insert(
+            "FACTORY_HOME_OVERRIDE".into(),
+            dir.path().join("factory").display().to_string(),
+        );
+        let (controls, sender, _) = controls(None);
+        drop(sender);
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            harness()
+                .run(req, controls)
+                .await
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+        )
+        .await
+        .unwrap()
+    }
+    fn child_parts(events: &[AgentEvent]) -> Vec<AgentEvent> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Subagent { event, .. } => Some(event.as_ref().clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn parent_frames_naming_their_session_still_render() {
+        let events = child_events("session-ids").await;
+        assert_eq!(text(&events), "initialautonomous");
+        assert_eq!(status(&events), DoneStatus::Completed);
+        let child = child_parts(&events);
+        assert_eq!(text(&child), "child finished\n\n");
+        assert_eq!(status(&child), DoneStatus::Completed);
+    }
+    #[tokio::test]
+    async fn child_settlement_uses_the_child_id_not_optional_tool_metadata() {
+        for prompt in [
+            "settle-without-tool",
+            "settle-empty-tool",
+            "settle-mismatched-tool",
+        ] {
+            let events = child_events(prompt).await;
+            assert_eq!(text(&events), "initialautonomous", "{prompt}");
+            let child = child_parts(&events);
+            assert_eq!(text(&child), "child finished\n\n", "{prompt}");
+            assert_eq!(status(&child), DoneStatus::Completed, "{prompt}");
+        }
+    }
+    #[tokio::test]
+    async fn child_text_written_after_the_drain_window_still_renders() {
+        let events = child_events("late-append").await;
+        let child = child_parts(&events);
+        assert_eq!(text(&child), "child finished\n\n");
+        assert_eq!(status(&child), DoneStatus::Completed);
+        assert!(matches!(child.last(), Some(AgentEvent::Done { .. })));
+    }
     #[tokio::test]
     async fn catalog_preserves_ids_efforts_and_uses_normal_cache() {
         let harness = harness();

@@ -657,7 +657,7 @@ impl Runner {
                 && self.queued.is_empty()
                 && self.deliveries.is_empty()
                 && self.background.is_empty()
-                && self.subagents.is_empty()
+                && !self.subagents.is_draining()
             {
                 return Ok(());
             }
@@ -723,11 +723,8 @@ impl Runner {
             "child_session_settled" => {
                 self.background.remove(string(frame, "childSessionId"));
                 turn.set_background(self.background.len());
-                self.subagents.finish(
-                    string(frame, "childSessionId"),
-                    string(frame, "toolUseId"),
-                    string(frame, "status"),
-                );
+                self.subagents
+                    .finish(string(frame, "childSessionId"), string(frame, "status"));
             }
             "create_message" if frame["message"]["role"] == "user" => {
                 if self.deliveries.remove(string(frame, "requestId")).is_some() {

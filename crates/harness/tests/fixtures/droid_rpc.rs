@@ -27,6 +27,11 @@ fn notify(value: Value) {
         json!({"type":"notification","method":"droid.session_notification","params":{"notification":value}}),
     );
 }
+fn notify_session(session: &str, value: Value) {
+    send(
+        json!({"type":"notification","method":"droid.session_notification","params":{"sessionId":session,"notification":value}}),
+    );
+}
 fn text(value: &str) {
     notify(
         json!({"type":"assistant_text_delta","messageId":"assistant","blockIndex":0,"textDelta":value}),
@@ -281,7 +286,27 @@ fn main() {
                     continue;
                 }
                 match next {
-                    "child-transcript" => {
+                    "child-transcript"
+                    | "session-ids"
+                    | "late-append"
+                    | "settle-without-tool"
+                    | "settle-empty-tool"
+                    | "settle-mismatched-tool" => {
+                        let stamped = next == "session-ids";
+                        let late_append = next == "late-append";
+                        let settle_tool = match next {
+                            "settle-without-tool" => None,
+                            "settle-empty-tool" => Some(""),
+                            "settle-mismatched-tool" => Some("different-tool"),
+                            _ => Some("spawn"),
+                        };
+                        let emit = move |value| {
+                            if stamped {
+                                notify_session(session, value);
+                            } else {
+                                notify(value);
+                            }
+                        };
                         let child = "11111111-1111-4111-8111-111111111111";
                         let root = std::path::PathBuf::from(
                             std::env::var_os("FACTORY_HOME_OVERRIDE").unwrap(),
@@ -298,16 +323,19 @@ fn main() {
                             writeln!(file, "{record}").unwrap();
                         }
                         file.flush().unwrap();
-                        tool("spawn", "Task", json!({"description":"fixture child"}));
-                        send(
-                            json!({"type":"notification","method":"droid.session_notification","params":{"sessionId":child,"notification":{"type":"assistant_text_delta","textDelta":"NOT PARENT TEXT"}}}),
+                        emit(
+                            json!({"type":"tool_call","toolUse":{"id":"spawn","name":"Task","input":{"description":"fixture child"}}}),
                         );
-                        notify(
+                        notify_session(
+                            child,
+                            json!({"type":"assistant_text_delta","textDelta":"NOT PARENT TEXT"}),
+                        );
+                        emit(
                             json!({"type":"child_session_available","childSessionId":child,"toolUseId":"spawn"}),
                         );
-                        text("initial");
+                        emit(json!({"type":"assistant_text_delta","textDelta":"initial"}));
                         active.store(false, Ordering::SeqCst);
-                        done("completed");
+                        emit(json!({"type":"agent_turn_completed","reason":"completed"}));
                         std::thread::spawn(move || {
                             std::thread::sleep(Duration::from_millis(350));
                             let result = json!({"type":"message","id":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"child-read","content":"fixture contents","is_error":false}]}}).to_string();
@@ -317,12 +345,18 @@ fn main() {
                             std::thread::sleep(Duration::from_millis(300));
                             writeln!(file, "{last}").unwrap();
                             file.flush().unwrap();
-                            notify(
-                                json!({"type":"child_session_settled","childSessionId":child,"toolUseId":"spawn","status":"completed"}),
-                            );
-                            text("autonomous");
-                            done("completed");
-                            std::thread::sleep(Duration::from_millis(100));
+                            let mut settled = json!({"type":"child_session_settled","childSessionId":child,"status":"completed"});
+                            if let Some(tool) = settle_tool {
+                                settled["toolUseId"] = tool.into();
+                            }
+                            emit(settled);
+                            emit(json!({"type":"assistant_text_delta","textDelta":"autonomous"}));
+                            emit(json!({"type":"agent_turn_completed","reason":"completed"}));
+                            std::thread::sleep(Duration::from_millis(if late_append {
+                                1500
+                            } else {
+                                100
+                            }));
                             writeln!(file, "{}", json!({"type":"message","id":"final","message":{"role":"assistant","content":[{"type":"text","text":"child finished"}]}})).unwrap();
                             file.flush().unwrap();
                         });

@@ -82,11 +82,15 @@ read the child's native `sessions/<cwd>/<id>.jsonl` under
 `FACTORY_HOME_OVERRIDE/.factory` or `~/.factory`, using the shared incremental
 transcript reader. Verify the header's child, parent, and tool IDs before
 rendering; omit context injections and encrypted thinking. Updates arrive at
-message/tool boundaries, not token
-granularity. Child permissions stay on the parent's approval path but their
-tool chips belong to the child transcript. Drain late appends after settlement,
-then emit a tagged terminal event. Missing or changed private-format histories
-degrade to chip-only. Later parent work is a new parent turn.
+message/tool boundaries, not token granularity.
+Child permissions stay on the parent's approval path but their
+tool chips belong to the child transcript. Settlement is authoritative by child
+session ID, independent of optional tool IDs. Drain until the transcript has
+been quiet for two seconds, including partial writes, with a ten-second maximum,
+then emit a tagged terminal event. Native background counts own runtime liveness;
+only bounded drains add an exit barrier, and teardown closes orphan histories.
+Missing or changed private-format histories degrade to chip-only.
+Later parent work is a new parent turn.
 The driver reports `deterministic_turn_end = false`.
 
 `model_authentication_failed` maps to `Done(Errored)` with terminal `/login`

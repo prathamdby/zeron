@@ -16,7 +16,8 @@ use super::normalize::{Normalizer, string};
 use crate::jsonl_tail::TailReader;
 
 pub(super) const POLL: Duration = Duration::from_millis(250);
-const DRAIN: Duration = Duration::from_secs(1);
+const DRAIN_QUIET: Duration = Duration::from_secs(2);
+const DRAIN_LIMIT: Duration = Duration::from_secs(10);
 
 pub(super) struct Subagents {
     root: PathBuf,
@@ -33,6 +34,7 @@ struct Child {
     seen: HashSet<String>,
     norm: Normalizer,
     finish: Option<(DoneStatus, Instant)>,
+    last_growth: Instant,
 }
 
 impl Subagents {
@@ -57,6 +59,10 @@ impl Subagents {
 
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.children.values().any(|child| child.finish.is_some())
     }
 
     pub fn start(&mut self, id: &str, parent: &str, tool: &str) {
@@ -92,13 +98,13 @@ impl Subagents {
                 seen: HashSet::new(),
                 norm: Normalizer::default(),
                 finish: None,
+                last_growth: Instant::now(),
             },
         );
     }
 
-    pub fn finish(&mut self, id: &str, tool: &str, status: &str) {
+    pub fn finish(&mut self, id: &str, status: &str) {
         if let Some(child) = self.children.get_mut(id)
-            && (tool.is_empty() || tool == child.tool)
             && child.finish.is_none()
         {
             let status = match status {
@@ -109,7 +115,9 @@ impl Subagents {
                 _ => DoneStatus::Errored,
             };
             // Lifecycle can beat the last transcript append.
-            child.finish = Some((status, Instant::now() + DRAIN));
+            let now = Instant::now();
+            child.finish = Some((status, now));
+            child.last_growth = now;
         }
     }
 
@@ -137,7 +145,8 @@ impl Subagents {
         self.children.retain(|_, child| {
             events.extend(child.read(&self.root));
             if let Some((status, at)) = child.finish
-                && Instant::now() >= at
+                && (Instant::now().duration_since(child.last_growth) >= DRAIN_QUIET
+                    || Instant::now().duration_since(at) >= DRAIN_LIMIT)
             {
                 events.push(child.done(status));
                 false
@@ -171,12 +180,18 @@ impl Child {
                 .find(|path| path.is_file())
                 .map(TailReader::new);
         }
+        let records = if let Some(reader) = self.reader.as_mut() {
+            let position = reader.position();
+            let records = reader.read_new();
+            if reader.position() != position {
+                self.last_growth = Instant::now();
+            }
+            records
+        } else {
+            Vec::new()
+        };
         let mut events = Vec::new();
-        for record in self
-            .reader
-            .as_mut()
-            .map_or_else(Vec::new, TailReader::read_new)
-        {
+        for record in records {
             if self.verified.is_none() && record["type"] == "session_start" {
                 self.verified = Some(
                     record["id"] == self.id
@@ -286,12 +301,12 @@ mod tests {
             matches!(tracker.poll().as_slice(), [AgentEvent::Subagent { event, .. }] if matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "hello\n\n"))
         );
         assert!(tracker.poll().is_empty());
-        tracker.finish(CHILD, "another-tool", "failed");
-        tokio::time::advance(DRAIN).await;
+        tracker.finish("unknown-child", "failed");
+        tokio::time::advance(DRAIN_QUIET).await;
         assert!(tracker.poll().is_empty());
         assert!(!tracker.is_empty());
-        tracker.finish(CHILD, "spawn", "failed");
-        tokio::time::advance(DRAIN).await;
+        tracker.finish(CHILD, "failed");
+        tokio::time::advance(DRAIN_QUIET).await;
         assert!(
             matches!(tracker.poll().as_slice(), [AgentEvent::Subagent { event, .. }] if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Errored, .. }))
         );
@@ -302,8 +317,8 @@ mod tests {
         assert!(
             matches!(tracker.poll().as_slice(), [AgentEvent::Subagent { parent_tool_use_id, event }] if parent_tool_use_id == "old-spawn" && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Interrupted, .. }))
         );
-        tracker.finish(CHILD, "new-spawn", "cancelled");
-        tokio::time::advance(DRAIN).await;
+        tracker.finish(CHILD, "cancelled");
+        tokio::time::advance(DRAIN_QUIET).await;
         assert!(
             matches!(tracker.poll().as_slice(), [AgentEvent::Subagent { parent_tool_use_id, event }] if parent_tool_use_id == "new-spawn" && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Interrupted, .. }))
         );
@@ -317,6 +332,10 @@ mod tests {
         tracker.start("../foreign", "parent", "spawn");
         assert!(tracker.is_empty());
         tracker.start(CHILD, "parent", "spawn");
+        assert!(
+            !tracker.is_draining(),
+            "orphan histories must not hold the exit gate"
+        );
         let mut file = history(root.path(), "foreign");
         writeln!(file, "{}", json!({"type":"message","id":"m","message":{"role":"assistant","content":[{"type":"text","text":"FOREIGN"}]}})).unwrap();
         assert!(tracker.poll().is_empty());
@@ -324,6 +343,55 @@ mod tests {
             matches!(tracker.close(DoneStatus::Interrupted).as_slice(), [AgentEvent::Subagent { event, .. }] if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Interrupted, .. }))
         );
         assert!(tracker.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_waits_for_partial_growth_and_has_a_hard_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut tracker = tracker(root.path());
+        let mut file = history(root.path(), "parent");
+        tracker.start(CHILD, "parent", "spawn");
+        assert!(tracker.poll().is_empty());
+        tracker.finish(CHILD, "completed");
+        assert!(tracker.is_draining());
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        write!(file, "{{\"type\":\"message\",\"id\":\"late\",").unwrap();
+        assert!(
+            tracker.poll().is_empty(),
+            "partial bytes extend the quiet period"
+        );
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        writeln!(file, "\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"late\"}}]}}}}").unwrap();
+        assert!(
+            matches!(tracker.poll().as_slice(), [AgentEvent::Subagent { event, .. }] if matches!(event.as_ref(), AgentEvent::TextDelta { text } if text == "late\n\n"))
+        );
+        tokio::time::advance(DRAIN_QUIET).await;
+        assert!(
+            matches!(tracker.poll().as_slice(), [AgentEvent::Subagent { event, .. }] if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. }))
+        );
+        assert!(tracker.is_empty());
+
+        tracker.start(CHILD, "parent", "spawn");
+        tracker.poll();
+        tracker.finish(CHILD, "completed");
+        let start = Instant::now();
+        while Instant::now().duration_since(start) < DRAIN_LIMIT {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            write!(file, " ").unwrap();
+            let events = tracker.poll();
+            if Instant::now().duration_since(start) < DRAIN_LIMIT {
+                assert!(events.is_empty(), "new bytes keep the drain open");
+                assert!(!tracker.is_empty());
+            } else {
+                assert!(
+                    matches!(events.as_slice(), [AgentEvent::Subagent { event, .. }] if matches!(event.as_ref(), AgentEvent::Done { .. }))
+                );
+            }
+        }
+        assert!(
+            tracker.is_empty(),
+            "continuous growth cannot hold the runtime forever"
+        );
     }
 
     #[test]
