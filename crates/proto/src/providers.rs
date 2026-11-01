@@ -8,7 +8,7 @@ use crate::HarnessId;
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
 /// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 11] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -17,6 +17,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::Devin, "Devin", "devin auth login"),
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
     (HarnessId::Pi, "Pi", "pi"),
+    (HarnessId::Droid, "Factory Droid", "droid"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
     (HarnessId::Muse, "Muse Code", "muse login"),
 ];
@@ -41,7 +42,7 @@ pub fn provider_name(harness: HarnessId) -> &'static str {
 /// Whether the provider reports plan usage. One that doesn't shows no meters
 /// and no "usage unavailable" note — there is nothing missing. Pure.
 pub fn reports_usage(harness: HarnessId) -> bool {
-    !matches!(harness, HarnessId::Antigravity | HarnessId::Fx)
+    !matches!(harness, HarnessId::Antigravity | HarnessId::Fx | HarnessId::Droid)
 }
 
 /// Providers whose agent holds exactly ONE login (Antigravity): once it is
@@ -53,7 +54,7 @@ pub fn keeps_one_login(harness: HarnessId) -> bool {
 /// Whether zeron switches this agent's logins. Hermes rotates through its
 /// own credential pool (listed, never reordered); Antigravity keeps one.
 pub fn switches_accounts(harness: HarnessId) -> bool {
-    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity | HarnessId::Fx)
+    !matches!(harness, HarnessId::Hermes | HarnessId::Antigravity | HarnessId::Fx | HarnessId::Droid)
 }
 
 /// A standing note under a provider's Accounts label, for an agent whose

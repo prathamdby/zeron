@@ -18,6 +18,8 @@ pub enum HarnessId {
     Fx,
     /// The Pi coding agent (pi.dev), driven over its native JSONL RPC protocol.
     Pi,
+    /// Factory Droid, driven over its native stream-jsonrpc protocol.
+    Droid,
     /// SST's opencode agent, driven natively over its own HTTP/SSE server
     /// protocol (`opencode serve` — the same wire the opencode desktop app
     /// speaks).
@@ -34,7 +36,7 @@ pub enum HarnessId {
 
 impl HarnessId {
     /// Every harness, in declaration order.
-    pub const ALL: [HarnessId; 12] = [
+    pub const ALL: [HarnessId; 13] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -43,6 +45,7 @@ impl HarnessId {
         HarnessId::Hermes,
         HarnessId::Fx,
         HarnessId::Pi,
+        HarnessId::Droid,
         HarnessId::Opencode,
         HarnessId::Antigravity,
         HarnessId::Muse,
@@ -60,6 +63,7 @@ impl HarnessId {
             HarnessId::Hermes => "hermes",
             HarnessId::Fx => "fx",
             HarnessId::Pi => "pi",
+            HarnessId::Droid => "droid",
             HarnessId::Opencode => "opencode",
             HarnessId::Antigravity => "antigravity",
             HarnessId::Muse => "muse",
