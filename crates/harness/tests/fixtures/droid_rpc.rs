@@ -281,6 +281,53 @@ fn main() {
                     continue;
                 }
                 match next {
+                    "child-transcript" => {
+                        let child = "11111111-1111-4111-8111-111111111111";
+                        let root = std::path::PathBuf::from(
+                            std::env::var_os("FACTORY_HOME_OVERRIDE").unwrap(),
+                        );
+                        let project = root.join(".factory/sessions/opaque-worktree");
+                        std::fs::create_dir_all(&project).unwrap();
+                        let path = project.join(format!("{child}.jsonl"));
+                        let mut file = std::fs::File::create(path).unwrap();
+                        for record in [
+                            json!({"type":"session_start","id":child,"callingSessionId":session,"callingToolUseId":"spawn"}),
+                            json!({"type":"message","id":"context","message":{"role":"user","content":[{"type":"text","text":"PRIVATE CONTEXT"}]}}),
+                            json!({"type":"message","id":"call","message":{"role":"assistant","content":[{"type":"thinking","encrypted_content":"OPAQUE THINKING"},{"type":"tool_use","id":"child-read","name":"Read","input":{"file_path":"fixture.txt"}}]}}),
+                        ] {
+                            writeln!(file, "{record}").unwrap();
+                        }
+                        file.flush().unwrap();
+                        tool("spawn", "Task", json!({"description":"fixture child"}));
+                        send(
+                            json!({"type":"notification","method":"droid.session_notification","params":{"sessionId":child,"notification":{"type":"assistant_text_delta","textDelta":"NOT PARENT TEXT"}}}),
+                        );
+                        notify(
+                            json!({"type":"child_session_available","childSessionId":child,"toolUseId":"spawn"}),
+                        );
+                        text("initial");
+                        active.store(false, Ordering::SeqCst);
+                        done("completed");
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(350));
+                            let result = json!({"type":"message","id":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"child-read","content":"fixture contents","is_error":false}]}}).to_string();
+                            let (first, last) = result.split_at(result.len() / 2);
+                            write!(file, "{first}").unwrap();
+                            file.flush().unwrap();
+                            std::thread::sleep(Duration::from_millis(300));
+                            writeln!(file, "{last}").unwrap();
+                            file.flush().unwrap();
+                            notify(
+                                json!({"type":"child_session_settled","childSessionId":child,"toolUseId":"spawn","status":"completed"}),
+                            );
+                            text("autonomous");
+                            done("completed");
+                            std::thread::sleep(Duration::from_millis(100));
+                            writeln!(file, "{}", json!({"type":"message","id":"final","message":{"role":"assistant","content":[{"type":"text","text":"child finished"}]}})).unwrap();
+                            file.flush().unwrap();
+                        });
+                        continue;
+                    }
                     "background" => {
                         notify(json!({"type":"child_session_available","childSessionId":"child"}));
                         text("initial");

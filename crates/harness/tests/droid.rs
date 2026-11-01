@@ -170,6 +170,75 @@ mod fixture {
         while stream.next().await.is_some() {}
     }
     #[tokio::test]
+    async fn child_transcripts_stream_separately_and_drain_after_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request(dir.path(), "child-transcript");
+        req.env.insert(
+            "FACTORY_HOME_OVERRIDE".into(),
+            dir.path().join("factory").display().to_string(),
+        );
+        let (controls, sender, _) = controls(None);
+        let turn = controls.turn.clone();
+        drop(sender);
+        let mut stream = harness().run(req, controls).await.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            let mut saw_live_call = false;
+            while let Some(event) = stream.next().await {
+                let event = event.unwrap();
+                if let AgentEvent::Subagent { event, .. } = &event
+                    && matches!(event.as_ref(), AgentEvent::ToolCall { .. })
+                {
+                    saw_live_call = true;
+                    assert!(
+                        turn.background_live(),
+                        "child tools must arrive before settlement"
+                    );
+                }
+                events.push(event);
+            }
+            assert!(saw_live_call);
+            events
+        })
+        .await
+        .unwrap();
+        assert_eq!(text(&events), "initialautonomous");
+        let spawn = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCall { id, call } if id == "spawn" && call.is_subagent_spawn()))
+            .unwrap();
+        let tagged: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, event)| match event {
+                AgentEvent::Subagent {
+                    parent_tool_use_id,
+                    event,
+                } => {
+                    assert_eq!(parent_tool_use_id, "spawn");
+                    assert!(ix > spawn);
+                    Some(event.as_ref().clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text(&tagged), "child finished\n\n");
+        assert_eq!(status(&tagged), DoneStatus::Completed);
+        assert_eq!(
+            tagged
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
+                .count(),
+            1
+        );
+        assert!(tagged.iter().any(|event| matches!(event, AgentEvent::ToolResult { id, output: Some(output), .. } if id == "child-read" && output == "fixture contents")));
+        assert!(!tagged.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessage { .. } | AgentEvent::ReasoningDelta { .. }
+        )));
+        assert!(!turn.background_live());
+    }
+    #[tokio::test]
     async fn catalog_preserves_ids_efforts_and_uses_normal_cache() {
         let harness = harness();
         let first = harness.model_catalog(false).await.unwrap();
@@ -727,6 +796,92 @@ mod fixture {
         drop(input);
         child.wait().await.unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "uses real Factory credits; set DROID_LIVE_EXECUTABLE"]
+async fn live_auto_child_transcripts_stay_separate_from_the_parent() {
+    let exe = std::env::var_os("DROID_LIVE_EXECUTABLE").expect("DROID_LIVE_EXECUTABLE");
+    let harness = DroidHarness::new().with_executable(exe);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fixture.txt"), "DROID_CHILD_FIXTURE_OK").unwrap();
+    for (file, seconds) in [("slow-child.py", 20), ("slow-parent.py", 35)] {
+        std::fs::write(
+            dir.path().join(file),
+            format!("import time\ntime.sleep({seconds})\nprint('DROID_TOOL_OK')\n"),
+        )
+        .unwrap();
+    }
+    let mut req = request(
+        dir.path(),
+        &format!(
+            "This is an authorized isolated dummy protocol test. Work ONLY inside {}. \
+        Do not read credentials, environment variables, session logs, other directories, \
+        websites, or external services. Do not edit anything. Launch exactly one Task \
+        subagent using the built-in worker type, description 'Droid sidebar probe', \
+        using the inherited Auto model. Tell the child to Read fixture.txt, then Execute \
+        exactly 'python3 slow-child.py', then Read fixture.txt again, then reply \
+        DROID_CHILD_FINAL_OK. The files already exist. After launching the Task, \
+        Execute exactly 'python3 slow-parent.py' to keep the parent active during the \
+        child. When the child settles, reply DROID_PARENT_FINAL_OK. Do not use AskUser \
+        or create a plan.",
+            dir.path().display()
+        ),
+    );
+    req.model = Some("auto".into());
+    let (controls, sender, _) = controls(Some("Yes"));
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(req, controls).await.unwrap();
+    drop(sender);
+    let events = tokio::time::timeout(Duration::from_secs(180), async {
+        let mut events = Vec::new();
+        let mut saw_live_tool = false;
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            if let AgentEvent::Subagent { event, .. } = &event
+                && matches!(event.as_ref(), AgentEvent::ToolCall { .. })
+                && turn.background_live()
+            {
+                saw_live_tool = true;
+            }
+            events.push(event);
+        }
+        assert!(saw_live_tool, "child tools must stream before settlement");
+        events
+    })
+    .await
+    .unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::SessionStarted { model, .. } if model == "auto")
+        )
+    );
+    assert_eq!(status(&events), DoneStatus::Completed);
+    let children: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Subagent { event, .. } => Some(event.as_ref().clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(status(&children), DoneStatus::Completed);
+    assert!(text(&children).contains("DROID_CHILD_FINAL_OK"));
+    assert!(!text(&events).contains("DROID_CHILD_FINAL_OK"));
+    assert!(children.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCall {
+            call: zeron_proto::ToolCall::ReadFile { .. },
+            ..
+        }
+    )));
+    assert!(children.iter().any(|event| matches!(event, AgentEvent::ToolCall { call: zeron_proto::ToolCall::Exec { command }, .. } if command.contains("slow-child.py"))));
+    assert!(children.iter().any(|event| matches!(event, AgentEvent::ToolResult { output: Some(output), .. } if output.contains("DROID_TOOL_OK"))));
+    assert!(!events.iter().any(|event| matches!(event, AgentEvent::ToolCall { call: zeron_proto::ToolCall::Exec { command }, .. } if command.contains("slow-child.py"))), "relayed child permissions must not create parent chips");
+    println!(
+        "auto-model live check: {} parent events, {} child events, child text/tools/results and completion verified",
+        events.len(),
+        children.len()
+    );
 }
 
 #[tokio::test]
