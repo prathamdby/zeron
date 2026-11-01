@@ -1,6 +1,7 @@
 //! Native Factory stream-jsonrpc driver. Compatibility and probe evidence: PROTOCOL.md.
 mod catalog;
 mod normalize;
+mod subagent;
 
 use crate::{
     Harness, HarnessError, RunControls, SteerMessage,
@@ -24,7 +25,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use zeron_proto::{
-    AccessMode, AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
+    AccessMode, AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
     UserInputAnswer, UserInputQuestion,
 };
 
@@ -252,6 +253,7 @@ impl Harness for DroidHarness {
                 interrupt,
                 turn,
             } = controls;
+            let subagents = subagent::Subagents::new(&request.env, &request.cwd);
             let mut runner = Runner {
                 process,
                 request,
@@ -268,6 +270,7 @@ impl Harness for DroidHarness {
                 dialogs: HashMap::new(),
                 answers: FuturesUnordered::new(),
                 background: HashSet::new(),
+                subagents,
                 stop_deadline: None,
             };
             let consumer = runner.tx.clone();
@@ -282,6 +285,13 @@ impl Harness for DroidHarness {
                 _ = consumer.closed() => Ok(()),
             };
             runner.cancel_dialogs().await;
+            for event in runner.subagents.close(if result.is_err() {
+                DoneStatus::Errored
+            } else {
+                DoneStatus::Interrupted
+            }) {
+                let _ = runner.emit(event).await;
+            }
             if let Err(error) = result {
                 let status =
                     tokio::time::timeout(Duration::from_millis(250), runner.process.child.wait())
@@ -446,6 +456,7 @@ struct Runner {
     dialogs: HashMap<String, (Value, Value)>,
     answers: FuturesUnordered<BoxFuture<'static, DialogAnswer>>,
     background: HashSet<String>,
+    subagents: subagent::Subagents,
     stop_deadline: Option<tokio::time::Instant>,
 }
 
@@ -630,6 +641,7 @@ impl Runner {
         self.initialize().await?;
         self.submit(None).await?;
         let mut open = true;
+        let mut child_poll = tokio::time::Instant::now();
         loop {
             if self.stop_deadline.is_none()
                 && self
@@ -645,12 +657,17 @@ impl Runner {
                 && self.queued.is_empty()
                 && self.deliveries.is_empty()
                 && self.background.is_empty()
+                && !self.subagents.is_draining()
             {
                 return Ok(());
             }
             tokio::select! {
                 event = self.process.next() => match event {
-                    Incoming::Notification { method, params } if method == "droid.session_notification" => self.notification(&params["notification"], turn).await?,
+                    Incoming::Notification { method, params } if method == "droid.session_notification" => {
+                        if params["sessionId"].as_str().is_none_or(|id| id == self.session) {
+                            self.notification(&params["notification"], turn).await?;
+                        }
+                    },
                     Incoming::Request { id, method, params } => self.request(id, &method, params).await?,
                     Incoming::Eof if !self.active => return Ok(()),
                     Incoming::Eof => return Err(protocol("Droid stdout closed before turn completion")),
@@ -664,6 +681,12 @@ impl Runner {
                         self.process.client.respond(&wire, answer.result);
                         self.emit(AgentEvent::InputResolved { request_id: answer.id, answers: Some(answer.answers) }).await?;
                     }
+                },
+                _ = tokio::time::sleep_until(child_poll), if !self.subagents.is_empty() => {
+                    for event in self.subagents.poll() {
+                        self.emit(event).await?;
+                    }
+                    child_poll = tokio::time::Instant::now() + subagent::POLL;
                 },
                 _ = turn.stop_requested(), if self.active && self.stop_deadline.is_none() => {
                     let _ = self.process.client.request_now("droid.interrupt_session", json!({}));
@@ -690,10 +713,18 @@ impl Runner {
                 self.background
                     .insert(string(frame, "childSessionId").into());
                 turn.set_background(self.background.len());
+                let tool = string(frame, "toolUseId");
+                for event in self.norm.flush(tool) {
+                    self.emit(event).await?;
+                }
+                self.subagents
+                    .start(string(frame, "childSessionId"), &self.session, tool);
             }
             "child_session_settled" => {
                 self.background.remove(string(frame, "childSessionId"));
                 turn.set_background(self.background.len());
+                self.subagents
+                    .finish(string(frame, "childSessionId"), string(frame, "status"));
             }
             "create_message" if frame["message"]["role"] == "user" => {
                 if self.deliveries.remove(string(frame, "requestId")).is_some() {
@@ -756,7 +787,11 @@ impl Runner {
         let (questions, cancelled, permission) = match method {
             "droid.request_permission" => {
                 for item in params["toolUses"].as_array().into_iter().flatten() {
-                    let events = match self.norm.permission(item) {
+                    let events = match self
+                        .subagents
+                        .permission(&params, item)
+                        .unwrap_or_else(|| self.norm.permission(item))
+                    {
                         Ok(events) => events,
                         Err(message) => {
                             self.process
