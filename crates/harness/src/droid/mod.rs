@@ -4,7 +4,7 @@ mod normalize;
 mod subagent;
 
 use crate::{
-    Harness, HarnessError, RunControls, SteerMessage,
+    Harness, HarnessError, InputOwner, InputRequest, RunControls, SteerMessage,
     approval::{self, Action},
     jsonrpc::{Incoming, RpcClient},
     process::{Command, Stdio, owned::Child},
@@ -12,7 +12,7 @@ use crate::{
 use async_trait::async_trait;
 use futures::{
     FutureExt, StreamExt,
-    future::BoxFuture,
+    future::{AbortHandle, Abortable, BoxFuture},
     stream::{BoxStream, FuturesUnordered},
 };
 use normalize::{Normalizer, string};
@@ -30,8 +30,7 @@ use zeron_proto::{
 };
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
-type Input =
-    dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync;
+type Input = crate::RequestInput;
 
 pub struct DroidHarness {
     executable: Option<PathBuf>,
@@ -278,13 +277,13 @@ impl Harness for DroidHarness {
                 value = runner.run(&mut steering, &turn, interrupt_grace) => value,
                 _ = interrupt.cancelled() => {
                     let _ = runner.process.client.request_now("droid.interrupt_session", json!({}));
-                    runner.cancel_dialogs().await;
+                    runner.cancel_dialogs(None).await;
                     runner.finish("cancelled").await;
                     Ok(())
                 },
                 _ = consumer.closed() => Ok(()),
             };
-            runner.cancel_dialogs().await;
+            runner.cancel_dialogs(None).await;
             for event in runner.subagents.close(if result.is_err() {
                 DoneStatus::Errored
             } else {
@@ -440,6 +439,41 @@ struct DialogAnswer {
     result: Value,
     answers: Vec<UserInputAnswer>,
 }
+
+fn input_owner(
+    params: &Value,
+    parent: &str,
+    background: &HashSet<String>,
+    active: bool,
+) -> Option<InputOwner> {
+    let mut child: Option<&str> = None;
+    if let Some(ids) = params.get("associatedSessionIds") {
+        for id in ids.as_array()? {
+            let id = id.as_str()?;
+            if id == parent {
+                continue;
+            }
+            if id.is_empty()
+                || !background.contains(id)
+                || child.is_some_and(|previous| previous != id)
+            {
+                return None;
+            }
+            child = Some(id);
+        }
+    }
+    if let Some(id) = child {
+        Some(InputOwner::Child(id.into()))
+    } else {
+        active.then_some(InputOwner::Parent)
+    }
+}
+struct Dialog {
+    wire: Value,
+    cancelled: Value,
+    owner: InputOwner,
+    abort: AbortHandle,
+}
 struct Runner {
     process: Process,
     request: RunRequest,
@@ -453,8 +487,8 @@ struct Runner {
     active: bool,
     queued: VecDeque<SteerMessage>,
     deliveries: HashMap<String, SteerMessage>,
-    dialogs: HashMap<String, (Value, Value)>,
-    answers: FuturesUnordered<BoxFuture<'static, DialogAnswer>>,
+    dialogs: HashMap<String, Dialog>,
+    answers: FuturesUnordered<BoxFuture<'static, Option<DialogAnswer>>>,
     background: HashSet<String>,
     subagents: subagent::Subagents,
     stop_deadline: Option<tokio::time::Instant>,
@@ -675,10 +709,10 @@ impl Runner {
                 },
                 steer = steering.recv(), if open => match steer { Some(steer) => self.queued.push_back(steer), None => open = false },
                 answer = self.answers.next(), if !self.answers.is_empty() => {
-                    if let Some(answer) = answer
-                        && let Some((wire, _)) = self.dialogs.remove(&answer.id)
+                    if let Some(Some(answer)) = answer
+                        && let Some(dialog) = self.dialogs.remove(&answer.id)
                     {
-                        self.process.client.respond(&wire, answer.result);
+                        self.process.client.respond(&dialog.wire, answer.result);
                         self.emit(AgentEvent::InputResolved { request_id: answer.id, answers: Some(answer.answers) }).await?;
                     }
                 },
@@ -691,7 +725,7 @@ impl Runner {
                 _ = turn.stop_requested(), if self.active && self.stop_deadline.is_none() => {
                     let _ = self.process.client.request_now("droid.interrupt_session", json!({}));
                     self.stop_deadline = Some(tokio::time::Instant::now() + interrupt_grace);
-                    self.cancel_dialogs().await;
+                    self.cancel_dialogs(Some(&InputOwner::Parent)).await;
                     self.queued.clear();
                     self.deliveries.clear();
                 },
@@ -721,7 +755,10 @@ impl Runner {
                     .start(string(frame, "childSessionId"), &self.session, tool);
             }
             "child_session_settled" => {
-                self.background.remove(string(frame, "childSessionId"));
+                let child = string(frame, "childSessionId");
+                self.background.remove(child);
+                self.cancel_dialogs(Some(&InputOwner::Child(child.into())))
+                    .await;
                 turn.set_background(self.background.len());
                 self.subagents
                     .finish(string(frame, "childSessionId"), string(frame, "status"));
@@ -756,7 +793,7 @@ impl Runner {
             self.emit(event).await?;
         }
         if frame["type"] == "agent_turn_completed" {
-            self.cancel_dialogs().await;
+            self.cancel_dialogs(Some(&InputOwner::Parent)).await;
             self.finish(if self.stop_deadline.is_some() {
                 "cancelled"
             } else {
@@ -766,10 +803,17 @@ impl Runner {
         }
         Ok(())
     }
-    async fn cancel_dialogs(&mut self) {
-        self.answers.clear();
-        for (id, (wire, result)) in self.dialogs.drain().collect::<Vec<_>>() {
-            self.process.client.respond(&wire, result);
+    async fn cancel_dialogs(&mut self, owner: Option<&InputOwner>) {
+        let ids: Vec<_> = self
+            .dialogs
+            .iter()
+            .filter(|(_, dialog)| owner.is_none_or(|owner| owner == &dialog.owner))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let dialog = self.dialogs.remove(&id).expect("selected dialog");
+            dialog.abort.abort();
+            self.process.client.respond(&dialog.wire, dialog.cancelled);
             let _ = self
                 .emit(AgentEvent::InputResolved {
                     request_id: id,
@@ -784,6 +828,26 @@ impl Runner {
         method: &str,
         params: Value,
     ) -> Result<(), HarnessError> {
+        if !matches!(method, "droid.request_permission" | "droid.ask_user") {
+            self.process
+                .client
+                .respond_error(&wire, -32601, "Unknown method");
+            return Ok(());
+        }
+        let Some(owner) = input_owner(
+            &params,
+            &self.session,
+            &self.background,
+            self.active && self.stop_deadline.is_none(),
+        ) else {
+            let cancelled = if method == "droid.request_permission" {
+                json!({"selectedOption":"cancel"})
+            } else {
+                json!({"cancelled":true,"answers":[]})
+            };
+            self.process.client.respond(&wire, cancelled);
+            return Ok(());
+        };
         let (questions, cancelled, permission) = match method {
             "droid.request_permission" => {
                 for item in params["toolUses"].as_array().into_iter().flatten() {
@@ -809,7 +873,9 @@ impl Runner {
                     }
                 }
                 let Some(question) = permission_question(&params, access(&self.request)) else {
-                    self.process.client.respond(&wire, json!({"selectedOption": if self.active { "proceed_once" } else { "cancel" }}));
+                    self.process
+                        .client
+                        .respond(&wire, json!({"selectedOption":"proceed_once"}));
                     return Ok(());
                 };
                 let option = if contains_plan(&params) {
@@ -868,7 +934,7 @@ impl Runner {
                 return Ok(());
             }
         };
-        if !self.active || questions.is_empty() {
+        if questions.is_empty() {
             self.process.client.respond(&wire, cancelled);
             return Ok(());
         }
@@ -878,9 +944,21 @@ impl Runner {
             questions: questions.clone(),
         })
         .await?;
-        let receiver = (self.input)(questions.clone());
-        self.dialogs.insert(id.clone(), (wire, cancelled.clone()));
-        self.answers.push(async move {
+        let receiver = (self.input)(InputRequest {
+            questions: questions.clone(),
+            owner: owner.clone(),
+        });
+        let (abort, registration) = AbortHandle::new_pair();
+        self.dialogs.insert(
+            id.clone(),
+            Dialog {
+                wire,
+                cancelled: cancelled.clone(),
+                owner,
+                abort,
+            },
+        );
+        self.answers.push(Abortable::new(async move {
             let answers = receiver.await.unwrap_or_default();
             let result = if let Some(option) = permission {
                 json!({"selectedOption": if approval::approved(&questions[0], &answers) { option.as_str() } else { "cancel" }})
@@ -892,7 +970,7 @@ impl Runner {
                 if encoded.len() != questions.len() { cancelled } else { json!({"answers":encoded}) }
             };
             DialogAnswer { id, result, answers }
-        }.boxed());
+        }, registration).map(Result::ok).boxed());
         Ok(())
     }
 }
@@ -961,6 +1039,59 @@ mod tests {
     use super::*;
     fn request() -> RunRequest {
         serde_json::from_value(json!({"prompt":"hello","model":null,"reasoning":null,"cwd":"/tmp","sandbox":"workspace-write","resume":null})).unwrap()
+    }
+    #[test]
+    fn input_ownership_requires_the_actual_live_child() {
+        let children = HashSet::from(["child".into(), "other-child".into()]);
+        for active in [false, true] {
+            assert_eq!(
+                input_owner(&json!({}), "parent", &children, active),
+                active.then_some(InputOwner::Parent)
+            );
+            assert_eq!(
+                input_owner(
+                    &json!({"associatedSessionIds":["parent"]}),
+                    "parent",
+                    &children,
+                    active
+                ),
+                active.then_some(InputOwner::Parent)
+            );
+            assert_eq!(
+                input_owner(
+                    &json!({"associatedSessionIds":["parent","child"]}),
+                    "parent",
+                    &children,
+                    active
+                ),
+                Some(InputOwner::Child("child".into()))
+            );
+            for ids in [
+                json!(["parent", "unknown"]),
+                json!(["child", "other-child"]),
+                json!([null]),
+                json!("child"),
+            ] {
+                assert_eq!(
+                    input_owner(
+                        &json!({"associatedSessionIds":ids}),
+                        "parent",
+                        &children,
+                        active
+                    ),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            input_owner(
+                &json!({"associatedSessionIds":["parent","child"]}),
+                "parent",
+                &HashSet::new(),
+                true
+            ),
+            None
+        );
     }
     #[test]
     fn settings_are_explicit_and_runtime_capabilities_match() {

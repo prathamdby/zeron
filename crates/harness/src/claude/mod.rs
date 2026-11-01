@@ -1221,7 +1221,7 @@ async fn run_session(session: Session) {
         interrupt,
         turn,
     } = controls;
-    let request_input = Arc::new(request_input);
+    let request_input = Arc::new(crate::parent_input(request_input));
 
     let mut pending_steers = std::collections::VecDeque::new();
     let mut reconfigures = 0u64;

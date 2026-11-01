@@ -84,7 +84,14 @@ transcript reader. Verify the header's child, parent, and tool IDs before
 rendering; omit context injections and encrypted thinking. Updates arrive at
 message/tool boundaries, not token granularity.
 Child permissions stay on the parent's approval path but their
-tool chips belong to the child transcript. Settlement is authoritative by child
+tool chips belong to the child transcript. Input ownership comes from
+`associatedSessionIds` and native live-child IDs, never transcript availability.
+Parent completion or turn stop closes only parent-owned input; child settlement
+closes that child's input, and runtime teardown closes all input. Late answers
+cannot reopen a completed turn. The engine keeps child questions in separate
+input entries so parent completion cannot resolve them. Missing child metadata
+uses the parent path; unknown or ambiguous explicit owners are declined.
+Settlement is authoritative by child
 session ID, independent of optional tool IDs. Drain until the transcript has
 been quiet for two seconds, including partial writes, with a ten-second maximum,
 then emit a tagged terminal event. Native background counts own runtime liveness;

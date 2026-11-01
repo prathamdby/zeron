@@ -291,7 +291,8 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
@@ -962,7 +963,8 @@ async fn supervised_plan_run_names_the_plan_agent_and_asks_before_commands() {
     let (mut controls, _steer, _token) = controls();
     let asked = Arc::new(Mutex::new(Vec::new()));
     let seen = asked.clone();
-    controls.request_input = Box::new(move |questions| {
+    controls.request_input = Box::new(move |input| {
+        let questions = input.questions;
         let (tx, rx) = oneshot::channel();
         let answers = questions
             .iter()
@@ -1635,7 +1637,8 @@ async fn live_access_modes_against_a_real_opencode() {
         let (mut controls, _steer, _token) = controls();
         let asked = Arc::new(Mutex::new(Vec::new()));
         let seen = asked.clone();
-        controls.request_input = Box::new(move |questions| {
+        controls.request_input = Box::new(move |input| {
+            let questions = input.questions;
             let (tx, rx) = oneshot::channel();
             let answers = questions
                 .iter()

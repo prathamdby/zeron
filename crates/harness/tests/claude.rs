@@ -65,7 +65,8 @@ fn controls(
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
@@ -334,7 +335,8 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -1842,7 +1844,8 @@ fn approving(
     let asked = Arc::new(Mutex::new(Vec::new()));
     let seen = asked.clone();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
             let answers = questions

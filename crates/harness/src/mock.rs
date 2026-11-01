@@ -242,7 +242,7 @@ impl Harness for MockHarness {
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         if question_mode {
-            let request_input = controls.request_input;
+            let request_input = crate::parent_input(controls.request_input);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             tokio::spawn(async move {
                 let pause = if delay_ms == 0 {
@@ -290,7 +290,7 @@ impl Harness for MockHarness {
         // asks before the script's command, the way a real agent's approval
         // reaches the person.
         if request.plan || !request.access.is_full_access() {
-            let request_input = controls.request_input;
+            let request_input = crate::parent_input(controls.request_input);
             let plan = request.plan;
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
             tokio::spawn(async move {

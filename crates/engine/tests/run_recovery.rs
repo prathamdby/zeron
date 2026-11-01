@@ -232,7 +232,7 @@ impl Harness for HoldingHarness {
             let _ = tx.send(Ok(AgentEvent::TextDelta {
                 text: "working on it…".into(),
             }));
-            let _answer = ask.then(|| (controls.request_input)(Vec::new()));
+            let _answer = ask.then(|| (controls.request_input)(Vec::new().into()));
             controls.interrupt.cancelled().await;
             match on_interrupt {
                 OnInterrupt::End => drop(tx),

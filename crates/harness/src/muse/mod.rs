@@ -163,7 +163,7 @@ impl MuseHarness {
                 interrupt,
                 turn,
             } = controls;
-            runner.input = Some(std::sync::Arc::from(request_input));
+            runner.input = Some(std::sync::Arc::from(crate::parent_input(request_input)));
             runner.turn = turn;
             let consumer = runner.tx.clone();
             let result = tokio::select! {

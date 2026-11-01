@@ -818,8 +818,8 @@ impl SessionDoc {
     /// Mark the input part carrying `request_id` resolved with `answers`,
     /// wherever it lives (input parts store the request id as their part
     /// id). The live-run path resolves through the entry fold; this direct
-    /// write is for answers to a question whose run already died — no fold
-    /// owns the entry anymore. Empty `answers` record the questions closed
+    /// write is for background questions outside that fold, or questions whose
+    /// run already died. Empty `answers` record the questions closed
     /// unanswered. Returns `false` when no such part exists.
     pub fn resolve_input(
         &self,

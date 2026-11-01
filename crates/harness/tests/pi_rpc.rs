@@ -404,7 +404,8 @@ async fn extension_dialogs_roundtrip_without_autoaccepting_and_preserve_editor_t
         let dir = tempfile::tempdir().unwrap();
         let (mut c, tx, _) = controls();
         drop(tx);
-        c.request_input = Box::new(move |questions| {
+        c.request_input = Box::new(move |input| {
+            let questions = input.questions;
             assert_eq!(questions.len(), 1);
             assert_eq!(questions[0].multiline, method == "editor");
             assert_eq!(questions[0].prefill.as_deref(), Some("initial\nvalue"));

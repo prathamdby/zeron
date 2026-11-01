@@ -83,7 +83,8 @@ fn controls(answers: Vec<UserInputAnswer>) -> (RunControls, Controls) {
             execution_lease: None,
             steering,
             interrupt: interrupt.clone(),
-            request_input: Box::new(move |questions| {
+            request_input: Box::new(move |input| {
+                let questions = input.questions;
                 // An answer for question "*" answers every question asked.
                 let answers: Vec<UserInputAnswer> = answers
                     .iter()

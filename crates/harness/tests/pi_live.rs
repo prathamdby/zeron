@@ -72,7 +72,8 @@ async fn real_pi_mock_lifecycle() {
             execution_lease: None,
             steering,
             interrupt: interrupt.clone(),
-            request_input: Box::new(|questions| {
+            request_input: Box::new(|input| {
+                let questions = input.questions;
                 let (tx, rx) = oneshot::channel();
                 tx.send(vec![UserInputAnswer {
                     question_id: questions[0].id.clone(),

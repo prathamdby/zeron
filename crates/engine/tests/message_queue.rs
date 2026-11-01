@@ -109,15 +109,18 @@ impl Harness for HeldHarness {
         let answer = self.asks.then(|| {
             // Only the engine can mint a request id it will honour, so the
             // question has to go through controls rather than the stream.
-            (controls.request_input)(vec![UserInputQuestion {
-                id: "q1".into(),
-                header: "Choose".into(),
-                question: "which one?".into(),
-                options: vec!["a".into(), "b".into()],
-                prefill: None,
-                multiline: false,
-                multi_select: false,
-            }])
+            (controls.request_input)(
+                vec![UserInputQuestion {
+                    id: "q1".into(),
+                    header: "Choose".into(),
+                    question: "which one?".into(),
+                    options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
+                    multi_select: false,
+                }]
+                .into(),
+            )
         });
         let finish = self.finish.subscribe();
         let steering = controls.steering;

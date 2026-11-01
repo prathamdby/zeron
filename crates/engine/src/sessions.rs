@@ -31,7 +31,6 @@ use zeron_doc::{
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage, TurnControl};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -60,7 +59,25 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
-type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+struct PendingInput {
+    owner: zeron_harness::InputOwner,
+    responder: Option<oneshot::Sender<Vec<UserInputAnswer>>>,
+    presented: bool,
+    parent_generation: Option<u64>,
+    answers: Option<Vec<UserInputAnswer>>,
+}
+
+type PendingInputs = Arc<Mutex<HashMap<String, PendingInput>>>;
+
+fn cancel_inputs(pending: &PendingInputs, parent_only: bool) {
+    for input in lock(pending).values_mut() {
+        if (!parent_only || input.owner == zeron_harness::InputOwner::Parent)
+            && let Some(tx) = input.responder.take()
+        {
+            let _ = tx.send(Vec::new());
+        }
+    }
+}
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -169,6 +186,8 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    parent_active: std::sync::atomic::AtomicBool,
+    parent_generation: std::sync::atomic::AtomicU64,
     /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
     /// event — the at-least-once ledger. A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
@@ -473,6 +492,12 @@ impl SessionsEngine {
     /// session parked BETWEEN turns is not: it holds a warm child with nothing
     /// outstanding, and takes the next prompt straight through its mailbox.
     pub fn turn_in_flight(&self, chat_id: &str) -> bool {
+        if lock(&self.inner.runs).get(chat_id).is_some_and(|run| {
+            !run.parent_active.load(std::sync::atomic::Ordering::Acquire)
+                && lock(&run.routed_steers).is_empty()
+        }) {
+            return false;
+        }
         lock(&self.inner.statuses)
             .get(chat_id)
             .is_some_and(is_active)
@@ -1012,30 +1037,47 @@ impl SessionsEngine {
         let request_input = {
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
-            Box::new(move |questions: Vec<UserInputQuestion>| {
+            Box::new(move |input: zeron_harness::InputRequest| {
                 let (mut tx, rx) = oneshot::channel();
                 let (answer_tx, answer_rx) = oneshot::channel();
                 let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), answer_tx);
+                lock(&pending).insert(
+                    request_id.clone(),
+                    PendingInput {
+                        owner: input.owner,
+                        responder: Some(answer_tx),
+                        presented: false,
+                        parent_generation: None,
+                        answers: None,
+                    },
+                );
                 let _ = engine_tx.send(AgentEvent::InputRequested {
                     request_id: request_id.clone(),
-                    questions,
+                    questions: input.questions,
                 });
                 let pending = pending.clone();
                 let engine_tx = engine_tx.clone();
                 tokio::spawn(async move {
-                    tokio::select! {
-                        // A dropped resolver stays an error for the harness, as before.
-                        answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
+                    let answers = tokio::select! {
+                        biased;
                         _ = tx.closed() => {
-                            lock(&pending).remove(&request_id);
-                            // The run stopped waiting: closed unanswered.
-                            let _ = engine_tx.send(AgentEvent::InputResolved {
-                                request_id,
-                                answers: Some(Vec::new()),
-                            });
-                        }
+                            if let Some(input) = lock(&pending).get_mut(&request_id) {
+                                input.responder.take();
+                            }
+                            Vec::new()
+                        },
+                        answer = answer_rx => {
+                            let answers = answer.unwrap_or_default();
+                            if tx.send(answers.clone()).is_ok() { answers } else { Vec::new() }
+                        },
+                    };
+                    if let Some(input) = lock(&pending).get_mut(&request_id) {
+                        input.answers = Some(answers.clone());
                     }
+                    let _ = engine_tx.send(AgentEvent::InputResolved {
+                        request_id,
+                        answers: Some(answers),
+                    });
                 });
                 rx
             })
@@ -1109,6 +1151,8 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                parent_active: std::sync::atomic::AtomicBool::new(!idle),
+                parent_generation: std::sync::atomic::AtomicU64::new(0),
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fork_history_sent: fork_history_sent.clone(),
                 retiring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1463,10 +1507,7 @@ impl SessionsEngine {
             return Ok(false); // parked between turns: nothing to stop
         }
         // Unpark questions first: the stopped turn can never be answered.
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
-        for tx in parked {
-            let _ = tx.send(Vec::new());
-        }
+        cancel_inputs(&pending, true);
         turn.stop_turn();
         let deadline = tokio::time::Instant::now() + STOP_SETTLE;
         while tokio::time::Instant::now() < deadline {
@@ -1508,10 +1549,7 @@ impl SessionsEngine {
         // classified as an error instead of an interrupted turn.
         let _ = cancel.send(true);
         // Unpark questions before harness teardown, which can await them.
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
-        for tx in parked {
-            let _ = tx.send(Vec::new());
-        }
+        cancel_inputs(&pending, false);
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
@@ -1550,19 +1588,17 @@ impl SessionsEngine {
     ) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs)
             .get(chat_id)
-            .map(|h| (h.pending_inputs.clone(), h.engine_tx.clone()));
-        let Some((pending, engine_tx)) = target else {
+            .map(|h| h.pending_inputs.clone());
+        let Some(pending) = target else {
             return Ok(false);
         };
-        let Some(resolver) = lock(&pending).remove(request_id) else {
+        let Some(resolver) = lock(&pending)
+            .get_mut(request_id)
+            .and_then(|input| input.responder.take())
+        else {
             return Ok(false);
         };
-        let _ = resolver.send(answers.clone());
-        let _ = engine_tx.send(AgentEvent::InputResolved {
-            request_id: request_id.to_string(),
-            answers: Some(answers),
-        });
-        Ok(true)
+        Ok(resolver.send(answers).is_ok())
     }
 
     /// Boot recovery: pick back up every turn the engine itself cut off — a
@@ -2168,7 +2204,9 @@ impl Inner {
                     status: DoneStatus::Errored,
                     finished_at: now,
                 });
-            } else if status == SessionStatus::Working && (fresh_start || !was_active) {
+            } else if (status == SessionStatus::Working && (fresh_start || !was_active))
+                || (status == SessionStatus::AwaitingInput && fresh_start)
+            {
                 entry.last_turn_outcome = None;
             }
             entry.updated_at = now;
@@ -2176,6 +2214,8 @@ impl Inner {
                 SessionStatus::Working if fresh_start || !was_active => {
                     entry.started_at = Some(now);
                 }
+                SessionStatus::AwaitingInput if outcome.is_some() => entry.started_at = None,
+                SessionStatus::AwaitingInput if fresh_start => entry.started_at = Some(now),
                 SessionStatus::Working | SessionStatus::AwaitingInput => {}
                 SessionStatus::Idle | SessionStatus::Errored => {
                     entry.started_at = None;
@@ -2653,9 +2693,66 @@ impl Inner {
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
-        let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+        let removed = {
+            let mut runs = lock(&self.runs);
+            if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+                runs.remove(chat_id)
+            } else {
+                None
+            }
+        };
+        if let Some(run) = removed {
+            let inputs = std::mem::take(&mut *lock(&run.pending_inputs));
+            for (id, input) in inputs {
+                if let Some(tx) = input.responder {
+                    let _ = tx.send(Vec::new());
+                }
+                if matches!(input.owner, zeron_harness::InputOwner::Child(_)) && input.presented {
+                    let answers = input.answers.unwrap_or_default();
+                    if let Some(host) = self.doc_host()
+                        && let Ok(handle) = host.open(chat_id)
+                    {
+                        let _ = handle.doc().resolve_input(&id, &answers);
+                    }
+                    self.publish(
+                        chat_id,
+                        &AgentEvent::InputResolved {
+                            request_id: id,
+                            answers: Some(answers),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn set_parent_active(&self, chat_id: &str, run_id: &str, active: bool) {
+        if let Some(run) = lock(&self.runs)
+            .get(chat_id)
+            .filter(|run| run.run_id == run_id)
+        {
+            let was_active = run
+                .parent_active
+                .swap(active, std::sync::atomic::Ordering::AcqRel);
+            if active && !was_active {
+                run.parent_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+    }
+
+    fn input_status(&self, chat_id: &str, parent_active: bool) -> SessionStatus {
+        let awaiting = lock(&self.runs).get(chat_id).is_some_and(|run| {
+            lock(&run.pending_inputs)
+                .values()
+                .any(|input| input.presented && input.responder.is_some())
+        });
+        if awaiting {
+            SessionStatus::AwaitingInput
+        } else if parent_active {
+            SessionStatus::Working
+        } else {
+            SessionStatus::Idle
         }
     }
 }
@@ -4251,6 +4348,7 @@ async fn drive_run(
                     idle_since = Some(tokio::time::Instant::now());
                     reap_deferred_until = None;
                     self_continued_turn = false;
+                    inner.set_parent_active(&chat_id, &run_id, false);
                     inner.set_status_with_completion(
                         &chat_id, SessionStatus::Idle, false, completed_turn, Some(DoneStatus::Completed),
                     );
@@ -4472,7 +4570,9 @@ async fn drive_run(
             let pending = lock(&inner.runs)
                 .get(&chat_id)
                 .map(|h| h.pending_inputs.clone());
-            let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+            let known = pending
+                .as_ref()
+                .is_some_and(|p| lock(p).contains_key(request_id));
             if !known {
                 tracing::warn!(
                     chat = %chat_id,
@@ -4480,6 +4580,85 @@ async fn drive_run(
                     "dropping harness-emitted InputRequested (unknown id; \
                      the engine input bridge owns this lifecycle)"
                 );
+                continue;
+            }
+            let pending = pending.expect("known input");
+            let child = lock(&pending)
+                .get(request_id)
+                .is_some_and(|input| matches!(input.owner, zeron_harness::InputOwner::Child(_)));
+            if child {
+                if !turn.background_live() {
+                    if let Some(tx) = lock(&pending)
+                        .get_mut(request_id)
+                        .and_then(|input| input.responder.take())
+                    {
+                        let _ = tx.send(Vec::new());
+                    }
+                    continue;
+                }
+                let mut parts = Vec::new();
+                fold_event_into_parts(&mut parts, &event);
+                if let Err(error) = finish_segment(
+                    doc_ref,
+                    None,
+                    &new_id(),
+                    &device_id,
+                    now_ms(),
+                    &parts,
+                    MessageStatus::Complete,
+                ) {
+                    tracing::warn!(chat = %chat_id, %error, "background input entry failed");
+                    if let Some(tx) = lock(&pending)
+                        .get_mut(request_id)
+                        .and_then(|input| input.responder.take())
+                    {
+                        let _ = tx.send(Vec::new());
+                    }
+                    continue;
+                }
+                if let Some(input) = lock(&pending).get_mut(request_id) {
+                    input.presented = true;
+                }
+                inner.publish(&chat_id, &event);
+                inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
+                continue;
+            }
+        }
+        if let AgentEvent::InputResolved {
+            request_id,
+            answers,
+        } = &event
+        {
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .map(|h| h.pending_inputs.clone());
+            let input = pending
+                .as_ref()
+                .and_then(|pending| lock(pending).remove(request_id));
+            let Some(input) = input else { continue };
+            if matches!(input.owner, zeron_harness::InputOwner::Child(_)) {
+                if input.presented {
+                    let _ =
+                        doc_ref.resolve_input(request_id, answers.as_deref().unwrap_or_default());
+                    inner.publish(&chat_id, &event);
+                    inner.set_status(
+                        &chat_id,
+                        inner.input_status(&chat_id, idle_since.is_none()),
+                        false,
+                    );
+                }
+                continue;
+            }
+            if !input.presented {
+                continue;
+            }
+            if !lock(&inner.runs).get(&chat_id).is_some_and(|run| {
+                input.parent_generation
+                    == Some(
+                        run.parent_generation
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    )
+            }) {
                 continue;
             }
         }
@@ -4551,31 +4730,36 @@ async fn drive_run(
                     "parked session resumed by self-continued agent output"
                 );
                 idle_since = None;
+                inner.set_parent_active(&chat_id, &run_id, true);
                 self_continued_turn = true;
                 // The park cleared the fold; rotate to a fresh entry and
                 // fall through — this event is the new segment's first part.
                 entry_id = new_id();
                 segment_started = now_ms();
-                inner.set_status(&chat_id, SessionStatus::Working, true);
+                inner.set_status(&chat_id, inner.input_status(&chat_id, true), true);
             } else {
                 match &event {
                     AgentEvent::SessionStarted { .. }
                         if resume_state.idle && !saw_session_started => {}
                     AgentEvent::Steered { .. } => {
                         idle_since = None;
-                        inner.set_status(&chat_id, SessionStatus::Working, true);
+                        inner.set_parent_active(&chat_id, &run_id, true);
+                        inner.set_status(&chat_id, inner.input_status(&chat_id, true), true);
                     }
                     AgentEvent::Done { .. } => {
                         idle_since = None;
                     }
-                    // A question with NO turn behind it (post-turn permission
-                    // noise): answer it empty right here. Un-parking into
+                    // A parent-owned question with no parent turn behind it:
+                    // answer it empty here. Live child input was handled above.
+                    // Un-parking this noise into
                     // AwaitingInput would disarm the idle reaper with no Done
                     // ever coming — stranded status, leaked warm child.
                     AgentEvent::InputRequested { request_id, .. } => {
-                        let resolver = lock(&inner.runs)
-                            .get(&chat_id)
-                            .and_then(|h| lock(&h.pending_inputs).remove(request_id));
+                        let resolver = lock(&inner.runs).get(&chat_id).and_then(|h| {
+                            lock(&h.pending_inputs)
+                                .get_mut(request_id)
+                                .and_then(|input| input.responder.take())
+                        });
                         if let Some(tx) = resolver {
                             let _ = tx.send(Vec::new());
                         }
@@ -4768,7 +4952,7 @@ async fn drive_run(
             // The elapsed timer is per user message, not per child process: a
             // steer boundary restarts it (matches the parked-resume path and
             // the composer's optimistic overlay, which already reads 0:00).
-            inner.set_status(&chat_id, SessionStatus::Working, true);
+            inner.set_status(&chat_id, inner.input_status(&chat_id, true), true);
             // The boundary confirms delivery of the oldest accepted steer —
             // retire its at-least-once ledger entry.
             let confirmed = lock(&inner.runs)
@@ -4822,12 +5006,35 @@ async fn drive_run(
                 run_session = Some((session_id.clone(), cwd));
             }
             AgentEvent::InputRequested { .. } => {
+                if let AgentEvent::InputRequested { request_id, .. } = &event
+                    && let Some(run) = lock(&inner.runs).get(&chat_id)
+                    && let Some(input) = lock(&run.pending_inputs).get_mut(request_id)
+                {
+                    input.presented = true;
+                    input.parent_generation = Some(
+                        run.parent_generation
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    );
+                }
                 // Known-id guaranteed: the unknown-id twin was dropped above,
                 // before the parked gate.
                 inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
             }
             AgentEvent::InputResolved { .. } => {
-                inner.set_status(&chat_id, SessionStatus::Working, false);
+                let awaiting = lock(&inner.runs).get(&chat_id).is_some_and(|run| {
+                    lock(&run.pending_inputs)
+                        .values()
+                        .any(|input| input.presented && input.responder.is_some())
+                });
+                inner.set_status(
+                    &chat_id,
+                    if awaiting {
+                        SessionStatus::AwaitingInput
+                    } else {
+                        SessionStatus::Working
+                    },
+                    false,
+                );
             }
             _ => {}
         }
@@ -4848,8 +5055,9 @@ async fn drive_run(
         }
 
         if let AgentEvent::Done { status, .. } = &event {
-            // A question still pending at turn end can never be legitimately
-            // answered (its turn is over): drain the resolvers NOW, or a late
+            // Only this parent's questions end with its turn. Child questions
+            // have separate entries and owners and must survive this boundary.
+            // Drain the parent resolvers now, or a late
             // `respond_input` finds one, emits InputResolved, and un-parks
             // the session into Working with no turn behind it — stranded
             // Working, timer forever, reaper disarmed. Empty answers unblock
@@ -4857,10 +5065,21 @@ async fn drive_run(
             let pending = lock(&inner.runs)
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
-                .map(|h| h.pending_inputs.clone());
-            if let Some(pending) = pending {
-                for (_, tx) in lock(&pending).drain() {
-                    let _ = tx.send(Vec::new());
+                .map(|h| {
+                    (
+                        h.pending_inputs.clone(),
+                        h.parent_generation
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    )
+                });
+            if let Some((pending, generation)) = pending {
+                for input in lock(&pending).values_mut() {
+                    if input.parent_generation == Some(generation)
+                        && input.owner == zeron_harness::InputOwner::Parent
+                        && let Some(tx) = input.responder.take()
+                    {
+                        let _ = tx.send(Vec::new());
+                    }
                 }
             }
             let message_status = match status {
@@ -4959,14 +5178,24 @@ async fn drive_run(
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
+                inner.set_parent_active(&chat_id, &run_id, false);
                 reap_deferred_until = None;
                 self_continued_turn = false;
                 // Accepted steers still own this runtime. Publishing Idle
                 // here lets the ordinary queue overtake that continuation.
+                let child_input = lock(&inner.runs).get(&chat_id).is_some_and(|run| {
+                    lock(&run.pending_inputs).values().any(|input| {
+                        input.presented
+                            && input.responder.is_some()
+                            && matches!(input.owner, zeron_harness::InputOwner::Child(_))
+                    })
+                });
                 inner.set_status_with_completion(
                     &chat_id,
                     if pending_steer {
                         SessionStatus::Working
+                    } else if child_input {
+                        SessionStatus::AwaitingInput
                     } else {
                         SessionStatus::Idle
                     },

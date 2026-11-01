@@ -35,7 +35,8 @@ fn controls(
             steering,
             interrupt: interrupt.clone(),
             turn: Default::default(),
-            request_input: Box::new(move |questions| {
+            request_input: Box::new(move |input| {
+                let questions = input.questions;
                 let (sender, receiver) = oneshot::channel();
                 if let Some(label) = answer {
                     let _ = sender.send(
@@ -168,6 +169,140 @@ mod fixture {
         assert!(!turn.background_live());
         drop(sender);
         while stream.next().await.is_some() {}
+    }
+    #[tokio::test]
+    async fn child_permissions_after_parent_done_follow_access_policy() {
+        for access in AccessMode::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let mut req = request(dir.path(), "background-permission");
+            req.access = access;
+            req.env.insert(
+                "FACTORY_HOME_OVERRIDE".into(),
+                dir.path().display().to_string(),
+            );
+            let events = collect(req, Some("Yes")).await;
+            assert_eq!(text(&events), "proceed_once", "{access:?}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::InputRequested { .. }))
+                    .count(),
+                usize::from(access != AccessMode::FullAccess)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn background_plan_approval_still_asks_in_full_access() {
+        for (answer, expected) in [(Some("Yes"), "proceed_auto_run_high"), (None, "cancel")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut req = request(dir.path(), "background-spec");
+            req.access = AccessMode::FullAccess;
+            req.env.insert(
+                "FACTORY_HOME_OVERRIDE".into(),
+                dir.path().display().to_string(),
+            );
+            let events = collect(req, answer).await;
+            assert_eq!(text(&events), expected);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::InputRequested { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+    #[tokio::test]
+    async fn child_dialogs_outlive_parent_completion_and_close_by_owner() {
+        for prompt in [
+            "background-ask-before",
+            "background-ask-after",
+            "background-ask-two",
+            "background-ask-settle",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut req = request(dir.path(), prompt);
+            req.env.insert(
+                "FACTORY_HOME_OVERRIDE".into(),
+                dir.path().display().to_string(),
+            );
+            let (mut controls, sender, _) = controls(None);
+            drop(sender);
+            let (asked_tx, mut asked_rx) = mpsc::unbounded_channel();
+            controls.request_input = Box::new(move |input| {
+                let (tx, rx) = oneshot::channel();
+                asked_tx.send((input, tx)).unwrap();
+                rx
+            });
+            let mut stream = harness().run(req, controls).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                let mut events = Vec::new();
+                let mut pending = Vec::new();
+                let mut parent_done = false;
+                let count = if prompt == "background-ask-two" { 2 } else { 1 };
+                while pending.len() < count || !parent_done {
+                    tokio::select! {
+                        Some(input) = asked_rx.recv() => pending.push(input),
+                        Some(event) = stream.next() => {
+                            let event = event.unwrap();
+                            parent_done |= matches!(event, AgentEvent::Done { .. });
+                            events.push(event);
+                        }
+                    }
+                }
+                for (input, tx) in pending {
+                    assert!(matches!(input.owner, zeron_harness::InputOwner::Child(_)));
+                    if prompt == "background-ask-settle" {
+                        while !tx.is_closed() {
+                            let event = stream.next().await.unwrap().unwrap();
+                            events.push(event);
+                        }
+                        assert!(
+                            tx.send(Vec::new()).is_err(),
+                            "settled child cannot accept late answers"
+                        );
+                    } else {
+                        assert!(
+                            !tx.is_closed(),
+                            "parent completion must not cancel child input"
+                        );
+                        tx.send(
+                            input
+                                .questions
+                                .into_iter()
+                                .map(|q| UserInputAnswer {
+                                    question_id: q.id,
+                                    labels: vec!["Yes".into()],
+                                })
+                                .collect(),
+                        )
+                        .unwrap();
+                    }
+                }
+                while let Some(event) = stream.next().await {
+                    events.push(event.unwrap());
+                }
+                assert_eq!(
+                    text(&events),
+                    if prompt == "background-ask-settle" {
+                        "cancel"
+                    } else if count == 2 {
+                        "answeredanswered"
+                    } else {
+                        "answered"
+                    }
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::InputResolved { .. }))
+                        .count(),
+                    count
+                );
+            })
+            .await
+            .unwrap();
+        }
     }
     #[tokio::test]
     async fn child_transcripts_stream_separately_and_drain_after_settlement() {
@@ -415,7 +550,8 @@ mod fixture {
                 req.plan = true;
                 let (mut controls, sender, _) = controls(None);
                 let (pending_tx, mut pending_rx) = mpsc::unbounded_channel();
-                controls.request_input = Box::new(move |questions| {
+                controls.request_input = Box::new(move |input| {
+                    let questions = input.questions;
                     let (tx, rx) = oneshot::channel();
                     pending_tx.send((questions, tx)).unwrap();
                     rx

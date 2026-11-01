@@ -432,7 +432,8 @@ impl Harness for PiHarness {
                 interrupt,
                 turn: _,
             } = controls;
-            runner.process.dialogs.input = Some(std::sync::Arc::from(request_input));
+            runner.process.dialogs.input =
+                Some(std::sync::Arc::from(crate::parent_input(request_input)));
             let consumer = runner.tx.clone();
             let result = tokio::select! {
                 result=runner.run(&mut steering)=>result,

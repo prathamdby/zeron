@@ -19,7 +19,8 @@ async fn main() {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()

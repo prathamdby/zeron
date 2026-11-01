@@ -10,7 +10,7 @@ use futures::StreamExt;
 use zeron_harness::{CancellationToken, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
+    UserInputAnswer,
 };
 
 use crate::EngineError;
@@ -289,7 +289,7 @@ async fn collect_text(
     let controls = RunControls {
         realtime: None,
         execution_lease,
-        request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
+        request_input: Box::new(|_| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
             rx

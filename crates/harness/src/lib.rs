@@ -175,6 +175,38 @@ pub fn same_model_options(
         .all(|key| a.get(key).and_then(canonical) == b.get(key).and_then(canonical))
 }
 
+/// The work whose completion closes an input request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputOwner {
+    Parent,
+    Child(String),
+}
+
+/// Ownership stays inside the host; frontend request IDs remain engine-owned.
+pub struct InputRequest {
+    pub questions: Vec<UserInputQuestion>,
+    pub owner: InputOwner,
+}
+
+impl From<Vec<UserInputQuestion>> for InputRequest {
+    fn from(questions: Vec<UserInputQuestion>) -> Self {
+        Self {
+            questions,
+            owner: InputOwner::Parent,
+        }
+    }
+}
+
+pub type RequestInput =
+    dyn Fn(InputRequest) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync;
+
+// Existing drivers ask on behalf of their current parent turn.
+pub(crate) fn parent_input(
+    input: Box<RequestInput>,
+) -> Box<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync> {
+    Box::new(move |questions| input(questions.into()))
+}
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     pub realtime: Option<codex::realtime::RealtimeControls>,
@@ -187,9 +219,7 @@ pub struct RunControls {
     /// No answers at all — an empty list, or a dropped sender — is a decline:
     /// the person closed the questions, or the run stopped waiting. Drivers
     /// answer it with their protocol's own decline where it has one.
-    pub request_input: Box<
-        dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
-    >,
+    pub request_input: Box<RequestInput>,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level

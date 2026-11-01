@@ -64,7 +64,7 @@ fn permission_options(kind: &str, autonomy: &str) -> Value {
     }
     json!(options)
 }
-fn permission(kind: &str, autonomy: &str) {
+fn permission(kind: &str, autonomy: &str, child: Option<&str>) {
     let item = |id: &str, name: &str, confirmation: &str, details: Value| json!({"toolUse":{"id":id,"name":name,"input":{"file_path":"note.txt","content":"hello","command":"printf hello"}},"confirmationType":confirmation,"details":details});
     let create = item(
         "create",
@@ -109,8 +109,12 @@ fn permission(kind: &str, autonomy: &str) {
         }
         _ => vec![exec],
     };
+    let mut params = json!({"toolUses":uses,"options":permission_options(kind, autonomy)});
+    if let Some(child) = child {
+        params["associatedSessionIds"] = json!(["droid-fixture-session", child]);
+    }
     send(
-        json!({"type":"request","id":"permission","method":"droid.request_permission","params":{"toolUses":uses,"options":permission_options(kind, autonomy)}}),
+        json!({"type":"request","id":if child.is_some() { "child-permission" } else { "permission" },"method":"droid.request_permission","params":params}),
     );
 }
 fn main() {
@@ -150,6 +154,27 @@ fn main() {
         let id = &frame["id"];
         let params = &frame["params"];
         if frame["type"] == "response" {
+            if id.as_str().is_some_and(|id| id.starts_with("child-")) {
+                let result = &frame["result"];
+                let outcome = result["selectedOption"].as_str().unwrap_or_else(|| {
+                    if result["answers"].as_array().is_some_and(|a| !a.is_empty()) {
+                        "answered"
+                    } else {
+                        "cancel"
+                    }
+                });
+                text(outcome);
+                let child = if id == "child-two" {
+                    "22222222-2222-4222-8222-222222222222"
+                } else {
+                    "11111111-1111-4111-8111-111111111111"
+                };
+                notify(
+                    json!({"type":"child_session_settled","childSessionId":child,"status":"completed"}),
+                );
+                done("completed");
+                continue;
+            }
             if !pending {
                 continue;
             }
@@ -286,6 +311,72 @@ fn main() {
                     continue;
                 }
                 match next {
+                    "background-ask-before"
+                    | "background-ask-after"
+                    | "background-ask-two"
+                    | "background-ask-settle" => {
+                        let children = [
+                            ("11111111-1111-4111-8111-111111111111", "child-one"),
+                            ("22222222-2222-4222-8222-222222222222", "child-two"),
+                        ];
+                        let count = if next == "background-ask-two" { 2 } else { 1 };
+                        for (child, id) in children.iter().take(count) {
+                            tool(id, "Task", json!({"description":"question child"}));
+                            notify(
+                                json!({"type":"child_session_available","childSessionId":child,"toolUseId":id}),
+                            );
+                        }
+                        let ask = |child: &str, id: &str| {
+                            send(
+                                json!({"type":"request","id":id,"method":"droid.ask_user","params":{
+                                    "associatedSessionIds":[session,child],
+                                    "questions":[{"index":1,"topic":id,"question":"Choose","options":["Yes","No"],"multiSelect":false}]
+                                }}),
+                            )
+                        };
+                        if next != "background-ask-before" {
+                            active.store(false, Ordering::SeqCst);
+                            done("completed");
+                        }
+                        for (child, id) in children.iter().take(count) {
+                            ask(child, id);
+                        }
+                        if next == "background-ask-before" {
+                            active.store(false, Ordering::SeqCst);
+                            done("completed");
+                        }
+                        if next == "background-ask-settle" {
+                            notify(
+                                json!({"type":"child_session_settled","childSessionId":children[0].0,"status":"completed"}),
+                            );
+                        }
+                        continue;
+                    }
+                    "background-permission" | "background-spec" => {
+                        let child = "11111111-1111-4111-8111-111111111111";
+                        tool("spawn", "Task", json!({"description":"permission child"}));
+                        notify(
+                            json!({"type":"child_session_available","childSessionId":child,"toolUseId":"spawn"}),
+                        );
+                        active.store(false, Ordering::SeqCst);
+                        done("completed");
+                        if next == "background-spec" {
+                            permission(
+                                "spec",
+                                settings["autonomyLevel"].as_str().unwrap(),
+                                Some(child),
+                            );
+                            continue;
+                        }
+                        send(
+                            json!({"type":"request","id":"child-permission","method":"droid.request_permission","params":{
+                                "associatedSessionIds":[session,child],
+                                "toolUses":[{"toolUse":{"id":"child-exec","name":"Execute","input":{"command":"printf child"}},"confirmationType":"exec","details":{"fullCommand":"printf child"}}],
+                                "options":[{"value":"proceed_once"},{"value":"cancel"}]
+                            }}),
+                        );
+                        continue;
+                    }
                     "child-transcript"
                     | "session-ids"
                     | "late-append"
@@ -440,7 +531,11 @@ fn main() {
                     }
                     value if value.starts_with("permission:") => {
                         pending = true;
-                        permission(&value[11..], settings["autonomyLevel"].as_str().unwrap());
+                        permission(
+                            &value[11..],
+                            settings["autonomyLevel"].as_str().unwrap(),
+                            None,
+                        );
                         continue;
                     }
                     "ask" => {

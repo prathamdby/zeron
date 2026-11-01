@@ -61,7 +61,8 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let controls = RunControls {
         realtime: None,
         execution_lease: None,
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
@@ -1334,7 +1335,8 @@ fn answering_controls(
     let asked: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
     let record = asked.clone();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |input| {
+            let questions = input.questions;
             let (tx, rx) = oneshot::channel();
             record
                 .lock()

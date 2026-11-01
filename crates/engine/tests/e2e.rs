@@ -1606,15 +1606,18 @@ impl Harness for EchoAnswerHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
         tokio::spawn(async move {
-            let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
-                id: "q1".into(),
-                header: "Pick".into(),
-                question: "Which one?".into(),
-                options: vec!["a".into(), "b".into()],
-                prefill: None,
-                multiline: false,
-                multi_select: false,
-            }])
+            let answers = (controls.request_input)(
+                vec![zeron_proto::UserInputQuestion {
+                    id: "q1".into(),
+                    header: "Pick".into(),
+                    question: "Which one?".into(),
+                    options: vec!["a".into(), "b".into()],
+                    prefill: None,
+                    multiline: false,
+                    multi_select: false,
+                }]
+                .into(),
+            )
             .await
             .unwrap_or_default();
             let picked = answers
@@ -1923,15 +1926,18 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
-                    id: "q1".into(),
-                    header: "Pick".into(),
-                    question: "Which one?".into(),
-                    options: vec!["a".into(), "b".into()],
-                    prefill: None,
-                    multiline: false,
-                    multi_select: false,
-                }])
+                let answers = (controls.request_input)(
+                    vec![zeron_proto::UserInputQuestion {
+                        id: "q1".into(),
+                        header: "Pick".into(),
+                        question: "Which one?".into(),
+                        options: vec!["a".into(), "b".into()],
+                        prefill: None,
+                        multiline: false,
+                        multi_select: false,
+                    }]
+                    .into(),
+                )
                 .await
                 .unwrap_or_default();
                 let picked = answers
@@ -2116,15 +2122,18 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                     // Blocks on the question; an interrupt fails the resolver
                     // (empty answers) and cancels the token — like a real CLI
                     // being torn down, the stream then ends WITHOUT a Done.
-                    let _ = (controls.request_input)(vec![zeron_proto::UserInputQuestion {
-                        id: "q1".into(),
-                        header: "Pick".into(),
-                        question: "Which one?".into(),
-                        options: vec!["a".into(), "b".into()],
-                        prefill: None,
-                        multiline: false,
-                        multi_select: false,
-                    }])
+                    let _ = (controls.request_input)(
+                        vec![zeron_proto::UserInputQuestion {
+                            id: "q1".into(),
+                            header: "Pick".into(),
+                            question: "Which one?".into(),
+                            options: vec!["a".into(), "b".into()],
+                            prefill: None,
+                            multiline: false,
+                            multi_select: false,
+                        }]
+                        .into(),
+                    )
                     .await;
                     interrupt.cancelled().await;
                     drop(tx);
@@ -2282,7 +2291,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
                         questions: vec![question.clone()],
                     }))
                     .await;
-                let answers = (controls.request_input)(vec![question])
+                let answers = (controls.request_input)(vec![question].into())
                     .await
                     .unwrap_or_default();
                 let picked = answers

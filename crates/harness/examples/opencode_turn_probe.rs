@@ -68,7 +68,8 @@ async fn main() {
             RunControls {
                 realtime: None,
                 execution_lease: None,
-                request_input: Box::new(move |questions| {
+                request_input: Box::new(move |input| {
+                    let questions = input.questions;
                     assert!(
                         answer_yes,
                         "set OPENCODE_PROBE_ANSWER_YES to answer permission prompts"

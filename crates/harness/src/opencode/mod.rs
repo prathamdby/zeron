@@ -2022,7 +2022,7 @@ async fn run_session(session: Session) {
         interrupt,
         turn: turn_control,
     } = controls;
-    let request_input = Arc::new(request_input);
+    let request_input = Arc::new(crate::parent_input(request_input));
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());
     let dir = directory.as_deref();
 

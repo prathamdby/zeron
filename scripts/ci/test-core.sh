@@ -24,7 +24,7 @@ tests=()
 for f in crates/harness/tests/*.rs crates/preview/tests/*.rs crates/doc/tests/*.rs; do
   tests+=(--test "$(basename "$f" .rs)")
 done
-for t in session_publication restart_resume side_chats codex_subagents claude_subagents local_profiles message_queue pi_resume droid_resume osc7501; do
+for t in session_publication restart_resume side_chats codex_subagents claude_subagents local_profiles message_queue pi_resume droid_resume droid_background_input osc7501; do
   tests+=(--test "$t")
 done
 

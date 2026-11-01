@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use zeron_harness::{CancellationToken, ClaudeHarness, CodexHarness, Harness, RunControls};
-use zeron_proto::{RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
+use zeron_proto::{RunRequest, SandboxLevel, UserInputAnswer};
 
 /// A stand-in agent CLI: records the env it was started with into its cwd
 /// (atomically, so the reader never sees a partial file) and exits.
@@ -58,7 +58,7 @@ fn controls() -> RunControls {
     RunControls {
         realtime: None,
         execution_lease: None,
-        request_input: Box::new(|_: Vec<UserInputQuestion>| {
+        request_input: Box::new(|_| {
             let (tx, rx) = oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
             rx

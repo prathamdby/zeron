@@ -331,7 +331,8 @@ impl TurnWire {
             controls: RunControls {
                 realtime: None,
                 execution_lease: None,
-                request_input: Box::new(move |questions| {
+                request_input: Box::new(move |input| {
+                    let questions = input.questions;
                     let answer = answer.expect("fixture must not ask for input");
                     questions_asked.lock().unwrap().extend(questions.clone());
                     let (tx, rx) = tokio::sync::oneshot::channel();

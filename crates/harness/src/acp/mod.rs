@@ -4316,7 +4316,7 @@ async fn run_session(session: Session) {
         interrupt,
         turn: turn_control,
     } = controls;
-    let request_input = std::sync::Arc::new(request_input);
+    let request_input = std::sync::Arc::new(crate::parent_input(request_input));
     let rules = ConfigRules {
         harness,
         effort_in_model_id,
